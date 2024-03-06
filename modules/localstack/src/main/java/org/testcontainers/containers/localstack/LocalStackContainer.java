@@ -4,6 +4,10 @@ import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
 import org.rnorth.ducttape.Preconditions;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.GenericContainer;
@@ -11,10 +15,13 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.ComparableVersion;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -54,6 +61,8 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
     @Deprecated
     public static final String VERSION = DEFAULT_TAG;
 
+    private static final OkHttpClient HTTP_CLIENT = new OkHttpClient();
+
     /**
      * Whether or to assume that all APIs run on different ports (when <code>true</code>) or are
      * exposed on a single port (<code>false</code>). From the Localstack README:
@@ -71,7 +80,7 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
     /**
      * Starting with version 0.13.0, setting services list on Localstack is not required. When <code>false</code>,
      * containers are started lazily. When <code>true</code>, container fails to start if services list is not provided.
-     *
+     * <p>
      * Testcontainers will use the tag of the docker image to infer whether or not the used version
      * of Localstack required services list.
      */
@@ -96,15 +105,15 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
     }
 
     /**
-     * @param dockerImageName    image name to use for Localstack
+     * @param dockerImageName image name to use for Localstack
      */
     public LocalStackContainer(final DockerImageName dockerImageName) {
         this(dockerImageName, shouldRunInLegacyMode(dockerImageName.getVersionPart()));
     }
 
     /**
-     * @param dockerImageName    image name to use for Localstack
-     * @param useLegacyMode      if true, each AWS service is exposed on a different port
+     * @param dockerImageName image name to use for Localstack
+     * @param useLegacyMode   if true, each AWS service is exposed on a different port
      * @deprecated use {@link #LocalStackContainer(DockerImageName)} instead
      */
     @Deprecated
@@ -128,6 +137,50 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
 
         ComparableVersion comparableVersion = new ComparableVersion(version);
         return comparableVersion.isGreaterThanOrEqualTo("2.0.0");
+    }
+
+    private boolean isUsingProImage() {
+        return getEnvMap().containsKey("LOCALSTACK_AUTH_TOKEN");
+    }
+
+    public LocalStackContainer withMultipleStates(String... stateFilePaths) {
+        Arrays
+            .stream(stateFilePaths)
+            .forEach(stateFilePath -> {
+                try {
+                    loadState(stateFilePath);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        return self();
+    }
+
+    public LocalStackContainer withState(String stateFilePath) throws IOException {
+        loadState(stateFilePath);
+        return self();
+    }
+
+    private void loadState(String stateFilePath) throws IOException {
+        if (!isUsingProImage()) {
+            throw new RuntimeException("Using state management features require a LocalStack Pro image.");
+        }
+        MediaType mediaType = MediaType.parse("application/octet-stream");
+        RequestBody requestBody = RequestBody.create(mediaType, Files.readAllBytes(Path.of(stateFilePath)));
+
+        try {
+            Request.Builder requestBuilder = new Request.Builder().url(getEndpoint() + "/_localstack/pods");
+
+            //body should be the payload of the state file
+            if (requestBody.contentLength() == 0) {
+                throw new RuntimeException("Missing file");
+            } else {
+                requestBuilder = requestBuilder.method("POST", requestBody);
+            }
+            HTTP_CLIENT.newCall(requestBuilder.build()).execute();
+        } catch (Exception ex) {
+            throw new RuntimeException("Could not perform request against LocalStack HTTP endpoint ", ex);
+        }
     }
 
     private static boolean isServicesEnvVarRequired(String version) {
@@ -219,6 +272,7 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
 
     /**
      * Declare a set of simulated AWS services that should be launched by this container.
+     *
      * @param services one or more service names
      * @return this container object
      */
@@ -235,14 +289,14 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
      * Provides an endpoint override that is preconfigured to communicate with a given simulated service.
      * The provided endpoint override should be set in the AWS Java SDK v2 when building a client, e.g.:
      * <pre><code>S3Client s3 = S3Client
-             .builder()
-             .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
-             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
-             localstack.getAccessKey(), localstack.getSecretKey()
-             )))
-             .region(Region.of(localstack.getRegion()))
-             .build()
-             </code></pre>
+     * .builder()
+     * .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
+     * .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+     * localstack.getAccessKey(), localstack.getSecretKey()
+     * )))
+     * .region(Region.of(localstack.getRegion()))
+     * .build()
+     * </code></pre>
      * <p><strong>Please note that this method is only intended to be used for configuring AWS SDK clients
      * that are running on the test host. If other containers need to call this one, they should be configured
      * specifically to do so using a Docker network and appropriate addressing.</strong></p>
@@ -266,14 +320,14 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
      * Provides an endpoint to communicate with LocalStack service.
      * The provided endpoint should be set in the AWS Java SDK v2 when building a client, e.g.:
      * <pre><code>S3Client s3 = S3Client
-             .builder()
-             .endpointOverride(localstack.getEndpoint())
-             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
-             localstack.getAccessKey(), localstack.getSecretKey()
-             )))
-             .region(Region.of(localstack.getRegion()))
-             .build()
-             </code></pre>
+     * .builder()
+     * .endpointOverride(localstack.getEndpoint())
+     * .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+     * localstack.getAccessKey(), localstack.getSecretKey()
+     * )))
+     * .region(Region.of(localstack.getRegion()))
+     * .build()
+     * </code></pre>
      * <p><strong>Please note that this method is only intended to be used for configuring AWS SDK clients
      * that are running on the test host. If other containers need to call this one, they should be configured
      * specifically to do so using a Docker network and appropriate addressing.</strong></p>
@@ -300,14 +354,15 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
      * <a href="https://github.com/localstack/localstack/blob/master/doc/interaction/README.md?plain=1#L32">AWS Access Key</a>
      * The access key can be used to construct AWS SDK v2 clients:
      * <pre><code>S3Client s3 = S3Client
-             .builder()
-             .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
-             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
-             localstack.getAccessKey(), localstack.getSecretKey()
-             )))
-             .region(Region.of(localstack.getRegion()))
-             .build()
-     </code></pre>
+     * .builder()
+     * .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
+     * .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+     * localstack.getAccessKey(), localstack.getSecretKey()
+     * )))
+     * .region(Region.of(localstack.getRegion()))
+     * .build()
+     * </code></pre>
+     *
      * @return a default access key
      */
     public String getAccessKey() {
@@ -319,14 +374,15 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
      * <a href="https://github.com/localstack/localstack/blob/master/doc/interaction/README.md?plain=1#L32">AWS Secret Key</a>
      * The secret key can be used to construct AWS SDK v2 clients:
      * <pre><code>S3Client s3 = S3Client
-             .builder()
-             .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
-             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
-             localstack.getAccessKey(), localstack.getSecretKey()
-             )))
-             .region(Region.of(localstack.getRegion()))
-             .build()
-     </code></pre>
+     * .builder()
+     * .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
+     * .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+     * localstack.getAccessKey(), localstack.getSecretKey()
+     * )))
+     * .region(Region.of(localstack.getRegion()))
+     * .build()
+     * </code></pre>
+     *
      * @return a default secret key
      */
     public String getSecretKey() {
@@ -337,14 +393,15 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
      * Provides a default region that is preconfigured to communicate with a given simulated service.
      * The region can be used to construct AWS SDK v2 clients:
      * <pre><code>S3Client s3 = S3Client
-             .builder()
-             .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
-             .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
-             localstack.getAccessKey(), localstack.getSecretKey()
-             )))
-             .region(Region.of(localstack.getRegion()))
-             .build()
-     </code></pre>
+     * .builder()
+     * .endpointOverride(localstack.getEndpointOverride(LocalStackContainer.Service.S3))
+     * .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+     * localstack.getAccessKey(), localstack.getSecretKey()
+     * )))
+     * .region(Region.of(localstack.getRegion()))
+     * .build()
+     * </code></pre>
+     *
      * @return a default region
      */
     public String getRegion() {
@@ -371,16 +428,14 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
         EC2("ec2", 4597),
         KINESIS("kinesis", 4568),
         DYNAMODB("dynamodb", 4569),
-        DYNAMODB_STREAMS("dynamodbstreams", 4570),
-        // TODO: Clarify usage for ELASTICSEARCH and ELASTICSEARCH_SERVICE
+        DYNAMODB_STREAMS("dynamodbstreams", 4570), // TODO: Clarify usage for ELASTICSEARCH and ELASTICSEARCH_SERVICE
         //        ELASTICSEARCH("es",           4571),
         S3("s3", 4572),
         FIREHOSE("firehose", 4573),
         LAMBDA("lambda", 4574),
         SNS("sns", 4575),
         SQS("sqs", 4576),
-        REDSHIFT("redshift", 4577),
-        //        ELASTICSEARCH_SERVICE("",   4578),
+        REDSHIFT("redshift", 4577), //        ELASTICSEARCH_SERVICE("",   4578),
         SES("ses", 4579),
         ROUTE53("route53", 4580),
         CLOUDFORMATION("cloudformation", 4581),
@@ -405,8 +460,7 @@ public class LocalStackContainer extends GenericContainer<LocalStackContainer> {
         @Deprecated
         /*
             Since version 0.11, LocalStack exposes all services on a single (4566) port.
-         */
-        public int getPort() {
+         */public int getPort() {
             return port;
         }
     }
